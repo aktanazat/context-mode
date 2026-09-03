@@ -368,4 +368,17 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
     // Must contain bar characters under the persistent memory header.
     expect(text).toMatch(/Persistent memory[\s\S]*?Files tracked[\s\S]*?█/);
   });
+
+  test("renders concern events with a human label", () => {
+    const text = formatReport(baseReport(), "1.0.103", null, {
+      lifetime: {
+        ...emptyLifetime(),
+        totalEvents: 1,
+        totalSessions: 1,
+        categoryCounts: { concern: 1 },
+      },
+    });
+
+    expect(text).toMatch(/Concerns logged\s+1/);
+  });
 });

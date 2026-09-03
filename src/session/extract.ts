@@ -60,6 +60,45 @@ export interface SessionEvent {
    */
   usage_scope?: string;
 }
+/** Shared wire payload for concern events. */
+export interface ConcernPayload {
+  schema: "context-mode.concern.v1";
+  source: "user" | "advisor" | "runtime" | "retrospective";
+  severity: "nit" | "concern" | "blocker";
+  note: string;
+  advisor?: string;
+  metrics?: Record<string, number>;
+  reasons?: string[];
+}
+
+/** Serialize concern telemetry into one session event. */
+export function buildConcernEvent(
+  type: string,
+  source: ConcernPayload["source"],
+  severity: ConcernPayload["severity"],
+  note: string,
+  advisor?: string,
+  metrics?: Record<string, number>,
+  reasons?: string[],
+  priority = 2,
+): SessionEvent {
+  const payload: ConcernPayload = {
+    schema: "context-mode.concern.v1",
+    source,
+    severity,
+    note,
+  };
+  if (advisor !== undefined) payload.advisor = advisor;
+  if (metrics !== undefined) payload.metrics = metrics;
+  if (reasons !== undefined) payload.reasons = reasons;
+
+  return {
+    type,
+    category: "concern",
+    data: JSON.stringify(payload),
+    priority,
+  };
+}
 
 export interface ToolCall {
   toolName: string;
@@ -2194,6 +2233,120 @@ export function extractTranscriptUsageSince(
 }
 
 // ── User-message extractors ────────────────────────────────────────────────
+const USER_CONCERN_AGENT_ACTIONS = [
+  "you keep retrying",
+  "you keep repeating",
+  "you keep doing the same thing",
+];
+const USER_CONCERN_AGENT_IMPACTS = [
+  "same thing",
+  "again and again",
+  "over and over",
+  "wasting time",
+  "waste my time",
+  "inefficient",
+  "pointless",
+];
+const USER_CONCERN_DIRECT_WASTE_CUES = [
+  "you keep wasting time",
+  "you are wasting my time",
+  "you're wasting my time",
+];
+const USER_CONCERN_WORKFLOW_REFERENCES = [
+  "this workflow",
+  "the current workflow",
+  "your workflow",
+];
+const USER_CONCERN_WORKFLOW_CUES = [
+  "inefficient",
+  "wasteful",
+  "wasting time",
+  "wastes time",
+  "a waste of time",
+  "needlessly slow",
+  "too slow",
+  "pointlessly repetitive",
+];
+const USER_CONCERN_META_TERMS = [
+  "complaint telemetry",
+  "concern telemetry",
+  "complaint tracking",
+  "concern tracking",
+  "complaint event",
+  "concern event",
+];
+const USER_CONCERN_META_PREFIXES = [
+  "add ",
+  "build ",
+  "create ",
+  "implement ",
+  "detect ",
+  "track ",
+  "record ",
+  "emit ",
+  "collect ",
+  "instrument ",
+  "write ",
+  "support ",
+  "please add ",
+  "can you add ",
+  "could you add ",
+  "we need ",
+  "i need ",
+];
+
+function includesConcernCue(message: string, cues: readonly string[]): boolean {
+  return cues.some((cue) => message.includes(cue));
+}
+
+function isStandaloneQuotedMessage(message: string): boolean {
+  const backtick = String.fromCharCode(96);
+  if (message.startsWith(backtick.repeat(3)) || message.startsWith(">")) return true;
+  const first = message[0];
+  const last = message[message.length - 1];
+  return (
+    (first === '"' && last === '"') ||
+    (first === "'" && last === "'") ||
+    (first === backtick && last === backtick) ||
+    (first === "“" && last === "”") ||
+    (first === "‘" && last === "’")
+  );
+}
+
+function isConcernTelemetryRequest(message: string): boolean {
+  return (
+    includesConcernCue(message, USER_CONCERN_META_TERMS) &&
+    USER_CONCERN_META_PREFIXES.some((prefix) => message.startsWith(prefix))
+  );
+}
+
+function extractUserConcern(message: string): SessionEvent[] {
+  const trimmed = message.trim();
+  if (!trimmed) return [];
+
+  const lower = trimmed.toLowerCase();
+  if (
+    isStandaloneQuotedMessage(trimmed) ||
+    trimmed.includes(String.fromCharCode(34)) ||
+    lower.startsWith("example:") ||
+    lower.startsWith("for example:") ||
+    lower.startsWith("e.g.") ||
+    isConcernTelemetryRequest(lower)
+  ) {
+    return [];
+  }
+
+  const repeatedAgentAction =
+    includesConcernCue(lower, USER_CONCERN_AGENT_ACTIONS) &&
+    includesConcernCue(lower, USER_CONCERN_AGENT_IMPACTS);
+  const directAgentWaste = includesConcernCue(lower, USER_CONCERN_DIRECT_WASTE_CUES);
+  const workflowComplaint =
+    includesConcernCue(lower, USER_CONCERN_WORKFLOW_REFERENCES) &&
+    includesConcernCue(lower, USER_CONCERN_WORKFLOW_CUES);
+  if (!repeatedAgentAction && !directAgentWaste && !workflowComplaint) return [];
+
+  return [buildConcernEvent("user_concern", "user", "concern", message)];
+}
 
 /**
  * Category 6: decision
@@ -2760,6 +2913,7 @@ export function extractUserEvents(message: string): SessionEvent[] {
     const events: SessionEvent[] = [];
 
     events.push(...extractUserPlan(message));
+    events.push(...extractUserConcern(message));
     events.push(...extractUserDecision(message));
     events.push(...extractRole(message));
     events.push(...extractIntent(message));

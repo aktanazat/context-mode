@@ -244,6 +244,7 @@ export const categoryLabels: Record<string, string> = {
   env: "Environment setup",
   task: "Tasks in progress",
   error: "Errors caught",
+  concern: "Concerns logged",
   // Continuity proof
   compact: "Compactions weathered",
   resume: "Sessions resumed cleanly",

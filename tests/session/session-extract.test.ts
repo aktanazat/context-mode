@@ -578,6 +578,48 @@ describe("Decision Events", () => {
     assert.equal(decisionEvents.length, 0);
   });
 });
+// ════════════════════════════════════════════
+// USER CONCERN EVENT EXTRACTION
+// ════════════════════════════════════════════
+
+describe("User Concern Events", () => {
+  test("extracts a repeated-retry complaint about the agent", () => {
+    const message = "you keep retrying the same thing and wasting time";
+    const concernEvents = extractUserEvents(message).filter(e => e.category === "concern");
+
+    assert.equal(concernEvents.length, 1);
+    assert.equal(concernEvents[0].type, "user_concern");
+    assert.equal(concernEvents[0].priority, 2);
+    assert.deepEqual(JSON.parse(concernEvents[0].data), {
+      schema: "context-mode.concern.v1",
+      source: "user",
+      severity: "concern",
+      note: message,
+    });
+  });
+
+  test("extracts an explicit workflow-efficiency complaint", () => {
+    const concernEvents = extractUserEvents("this workflow is hella inefficient")
+      .filter(e => e.category === "concern");
+
+    assert.equal(concernEvents.length, 1);
+    assert.equal(concernEvents[0].type, "user_concern");
+  });
+
+  test("ignores meta requests, quoted examples, bug reports, and single failures", () => {
+    const messages = [
+      "Build complaint telemetry for when users say this workflow is hella inefficient.",
+      'The phrase "this workflow is hella inefficient" is an example.',
+      "The parser crashes on null input.",
+      "This workflow failed once after a timeout.",
+    ];
+
+    for (const message of messages) {
+      const concernEvents = extractUserEvents(message).filter(e => e.category === "concern");
+      assert.equal(concernEvents.length, 0, message);
+    }
+  });
+});
 
 // ════════════════════════════════════════════
 // SLICE 8: RULE EVENT EXTRACTION (user messages)

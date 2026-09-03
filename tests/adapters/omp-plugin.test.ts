@@ -72,6 +72,31 @@ async function registerOmpPlugin(
   register(mockApi as unknown as Parameters<typeof register>[0]);
   return mockApi;
 }
+async function getCurrentSessionEvents() {
+  const plugin = await import("../../src/adapters/omp/plugin.js");
+  const adapterModule = await import("../../src/adapters/omp/index.js");
+  const dbModule = await import("../../src/session/db.js");
+  const db = new SessionDB({
+    dbPath: dbModule.resolveSessionDbPath({
+      projectDir: tempDir,
+      sessionsDir: new adapterModule.OMPAdapter().getSessionDir(),
+    }),
+  });
+  try {
+    return db.getEvents(plugin._getOmpPluginSessionIdForTests());
+  } finally {
+    db.close();
+  }
+}
+async function startConcernRun() {
+  await registerOmpPlugin(api);
+  await api._trigger(
+    "session_start",
+    { type: "session_start" },
+    { sessionManager: { getSessionFile: () => join(tempDir, "session.json") } },
+  );
+  await api._trigger("agent_start", { type: "agent_start" });
+}
 
 describe("OMP plugin", () => {
   beforeEach(() => {
@@ -319,6 +344,144 @@ describe("OMP plugin", () => {
     });
   });
 
+  describe("concern lifecycle", () => {
+    it("captures a user concern from a new context message", async () => {
+      await startConcernRun();
+      await api._trigger("context", {
+        messages: [{ role: "user", content: "you keep retrying the same thing and wasting time" }],
+      });
+
+      const concern = (await getCurrentSessionEvents()).find((event) => event.type === "user_concern");
+      expect(concern).toMatchObject({ type: "user_concern", category: "concern", priority: 2 });
+      expect(JSON.parse(concern!.data)).toMatchObject({
+        schema: "context-mode.concern.v1",
+        source: "user",
+        severity: "concern",
+      });
+    });
+
+    it("captures advisor notes at their declared severities", async () => {
+      await startConcernRun();
+      await api._trigger("context", {
+        messages: [{
+          role: "custom",
+          customType: "advisor",
+          details: {
+            notes: [
+              { note: "Rename this variable.", severity: "nit", advisor: "style" },
+              { note: "This branch can hide the failure.", severity: "concern", advisor: "review" },
+              { note: "Do not ship this change.", severity: "blocker", advisor: "safety" },
+            ],
+          },
+        }],
+      });
+
+      const advisorEvents = (await getCurrentSessionEvents()).filter((event) =>
+        ["advisor_nit", "advisor_concern", "advisor_blocker"].includes(event.type),
+      );
+      expect(advisorEvents.map((event) => event.type)).toEqual([
+        "advisor_nit",
+        "advisor_concern",
+        "advisor_blocker",
+      ]);
+      expect(JSON.parse(advisorEvents[2]!.data)).toMatchObject({
+        schema: "context-mode.concern.v1",
+        source: "advisor",
+        severity: "blocker",
+        advisor: "safety",
+      });
+    });
+
+    it("persists automatic retry start and failure evidence", async () => {
+      await startConcernRun();
+      await api._trigger("auto_retry_start", { attempt: 1 });
+      await api._trigger("auto_retry_end", { attempt: 1, success: false });
+
+      const retryEvents = (await getCurrentSessionEvents()).filter((event) => event.type === "runtime_concern");
+      expect(retryEvents).toHaveLength(2);
+      expect(JSON.parse(retryEvents[0]!.data)).toMatchObject({
+        source: "runtime",
+        severity: "nit",
+        reasons: ["auto_retry_started"],
+      });
+      expect(JSON.parse(retryEvents[1]!.data)).toMatchObject({
+        source: "runtime",
+        severity: "concern",
+        reasons: ["auto_retry_failed"],
+      });
+    });
+
+    it("scans repeated context hooks without duplicating a user concern", async () => {
+      await startConcernRun();
+      const context = {
+        messages: [{ role: "user", content: "you keep retrying the same thing and wasting time" }],
+      };
+      await api._trigger("context", context);
+      await api._trigger("context", context);
+
+      const concerns = (await getCurrentSessionEvents()).filter((event) => event.type === "user_concern");
+      expect(concerns).toHaveLength(1);
+    });
+
+    it("emits one retrospective after the final agent end and resets the run", async () => {
+      await startConcernRun();
+      await api._trigger("turn_end", {});
+      await api._trigger("turn_end", {});
+      for (const text of ["permission denied", "permission denied", "unexpected tool failure"]) {
+        await api._trigger("tool_result", {
+          toolName: "bash",
+          input: { command: "false" },
+          content: [{ type: "text", text }],
+          isError: true,
+        });
+      }
+
+      await api._trigger("agent_end", { willContinue: true });
+      expect((await getCurrentSessionEvents()).filter((event) => event.type === "workflow_retrospective")).toHaveLength(0);
+
+      await api._trigger("agent_start", { type: "agent_start" });
+      await api._trigger("agent_end", { willContinue: false });
+      const retrospectives = (await getCurrentSessionEvents()).filter(
+        (event) => event.type === "workflow_retrospective",
+      );
+      expect(retrospectives).toHaveLength(1);
+      expect(JSON.parse(retrospectives[0]!.data)).toMatchObject({
+        schema: "context-mode.concern.v1",
+        source: "retrospective",
+        severity: "concern",
+        metrics: {
+          turns: 2,
+          tool_results: 3,
+          tool_errors: 3,
+          retries: 0,
+          failed_retries: 0,
+        },
+      });
+      expect(JSON.parse(retrospectives[0]!.data).reasons).toEqual(
+        expect.arrayContaining(["repeated_tool_error", "high_tool_error_rate"]),
+      );
+
+      await api._trigger("agent_start", { type: "agent_start" });
+      await api._trigger("agent_end", { willContinue: false });
+      expect((await getCurrentSessionEvents()).filter((event) => event.type === "workflow_retrospective")).toHaveLength(1);
+    });
+
+    it("does not emit a retrospective for a clean run", async () => {
+      await startConcernRun();
+      await api._trigger("turn_end", {});
+      await api._trigger("tool_result", {
+        toolName: "read",
+        input: { file_path: "/tmp/clean.ts" },
+        content: [{ type: "text", text: "ok" }],
+      });
+      await api._trigger("agent_end", { willContinue: false });
+
+      const retrospectives = (await getCurrentSessionEvents()).filter(
+        (event) => event.type === "workflow_retrospective",
+      );
+      expect(retrospectives).toHaveLength(0);
+    });
+  });
   // ═══════════════════════════════════════════════════════════
   // Issue #645 — OMP plugin SessionDB path must match the MCP
   // server's canonical resolver (`resolveSessionDbPath`). The

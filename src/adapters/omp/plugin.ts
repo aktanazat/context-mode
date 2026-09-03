@@ -30,7 +30,12 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { resolveSessionDbPath, SessionDB } from "../../session/db.js";
-import { extractEvents, buildAgentUsageEvent } from "../../session/extract.js";
+import {
+  buildAgentUsageEvent,
+  buildConcernEvent,
+  extractEvents,
+  extractUserEvents,
+} from "../../session/extract.js";
 import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
@@ -73,6 +78,8 @@ const BLOCKED_BASH_PATTERNS: RegExp[] = [
 let _db: SessionDB | null = null;
 let _dbPath = "";
 let _sessionId = "";
+let _run: RunState | null = null;
+const _scannedContextMessages = new Set<string>();
 
 const _ompAdapter = new OMPAdapter();
 
@@ -192,6 +199,7 @@ export function _resetOmpPluginStateForTests(): void {
   _db = null;
   _dbPath = "";
   _sessionId = "";
+  resetConcernLifecycle();
 }
 
 /**
@@ -219,6 +227,32 @@ type ToolResultEvent = {
   isError?: boolean;
 };
 type ToolCallEventResult = { block?: boolean; reason?: string };
+type ContextTextPart = { text?: string };
+type ConcernSeverity = "nit" | "concern" | "blocker";
+type AdvisorNote = { note?: string; severity?: ConcernSeverity; advisor?: string };
+type AdvisorDetails = { notes?: AdvisorNote[] };
+type ContextMessage = {
+  role?: string;
+  content?: string | ContextTextPart[];
+  customType?: string;
+  details?: AdvisorDetails;
+  timestamp?: number;
+};
+type ContextEvent = { messages?: ContextMessage[] };
+type AgentStartEvent = { type?: string };
+type AgentEndEvent = { willContinue?: boolean };
+type AutoRetryStartEvent = { attempt?: number };
+type AutoRetryEndEvent = { attempt?: number; success?: boolean };
+type RunState = {
+  turns: number;
+  toolResults: number;
+  toolErrors: number;
+  retries: number;
+  failedRetries: number;
+  hasUserConcern: boolean;
+  hasAdvisorNote: boolean;
+  toolErrorCounts: Map<string, number>;
+};
 // turn_end / agent_end usage-bearing event. Shape is intentionally loose — the
 // pure parseOmpUsage() (usage.ts) does the null-safe field extraction. Refs:
 // AssistantMessage (refs/platforms/omp/packages/ai/src/types.ts:505-541),
@@ -230,12 +264,102 @@ type TurnEndEvent = {
 };
 type HookEventCtx = Record<string, unknown> | undefined;
 type HookHandler<E, R = void> = (event: E, ctx: HookEventCtx) => R | undefined | Promise<R | undefined>;
+function createRunState(): RunState {
+  return {
+    turns: 0,
+    toolResults: 0,
+    toolErrors: 0,
+    retries: 0,
+    failedRetries: 0,
+    hasUserConcern: false,
+    hasAdvisorNote: false,
+    toolErrorCounts: new Map(),
+  };
+}
+
+function resetConcernLifecycle(): void {
+  _run = null;
+  _scannedContextMessages.clear();
+}
+
+function getMessageText(content: ContextMessage["content"]): string | null {
+  if (!Array.isArray(content)) return content ?? null;
+  const textParts = content.flatMap(part => part.text === undefined ? [] : [part.text]);
+  return textParts.length > 0 ? textParts.join("\n") : null;
+}
+
+function getContextMessageKey(message: ContextMessage): string | null {
+  try {
+    return createHash("sha256")
+      .update(JSON.stringify({
+        role: message.role,
+        content: message.content,
+        customType: message.customType,
+        details: message.details,
+        timestamp: message.timestamp,
+      }))
+      .digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+function getAdvisorNotes(details: ContextMessage["details"]): AdvisorNote[] {
+  return details?.notes ?? [];
+}
+
+function getAdvisorSeverity(value: AdvisorNote["severity"]): ConcernSeverity {
+  return value ?? "concern";
+}
+
+function hasRepeatedToolError(run: RunState): boolean {
+  for (const count of run.toolErrorCounts.values()) {
+    if (count >= 2) return true;
+  }
+  return false;
+}
+
+function getRetrospectiveReasons(run: RunState): string[] {
+  const reasons: string[] = [];
+  if (run.hasUserConcern) reasons.push("user_concern");
+  if (run.hasAdvisorNote) reasons.push("advisor_note");
+  if (run.failedRetries > 0) reasons.push("failed_retry");
+  if (run.retries >= 2) reasons.push("multiple_retries");
+  if (hasRepeatedToolError(run)) reasons.push("repeated_tool_error");
+  if (run.toolErrors >= 3 && run.toolErrors * 4 >= run.toolResults) {
+    reasons.push("high_tool_error_rate");
+  }
+  return reasons;
+}
+
+function getRetryMetrics(
+  event: AutoRetryStartEvent | AutoRetryEndEvent,
+  run: RunState | null,
+): Record<string, number> | undefined {
+  const metrics: Record<string, number> = {};
+  let hasMetric = false;
+  if (event.attempt !== undefined && Number.isFinite(event.attempt)) {
+    metrics.attempt = event.attempt;
+    hasMetric = true;
+  }
+  if (run) {
+    metrics.retries = run.retries;
+    metrics.failed_retries = run.failedRetries;
+    hasMetric = true;
+  }
+  return hasMetric ? metrics : undefined;
+}
 
 export interface MinimalHookAPI {
   on(event: "session_start", handler: HookHandler<{ type: "session_start" }>): void;
   on(event: "session_before_compact", handler: HookHandler<{ type: "session_before_compact" }>): void;
   on(event: "tool_call", handler: HookHandler<ToolCallEvent, ToolCallEventResult>): void;
   on(event: "tool_result", handler: HookHandler<ToolResultEvent>): void;
+  on(event: "context", handler: HookHandler<ContextEvent>): void;
+  on(event: "agent_start", handler: HookHandler<AgentStartEvent>): void;
+  on(event: "agent_end", handler: HookHandler<AgentEndEvent>): void;
+  on(event: "auto_retry_start", handler: HookHandler<AutoRetryStartEvent>): void;
+  on(event: "auto_retry_end", handler: HookHandler<AutoRetryEndEvent>): void;
   // turn_end carries a single per-turn AssistantMessage with `.usage`/`.model`
   // (refs/.../extensibility/shared-events.ts:204-208). agent_end carries
   // `messages: AssistantMessage[]` (:191-194) — both flow through parseOmpUsage.
@@ -267,6 +391,7 @@ export default function ompPlugin(pi: MinimalHookAPI): void {
   // ── 1. session_start — initialize session row ─────────
   pi.on("session_start", (_event, ctx) => {
     try {
+      resetConcernLifecycle();
       _sessionId = deriveSessionId(ctx);
       db.ensureSession(_sessionId, projectDir);
       db.cleanupOldSessions(7);
@@ -322,6 +447,18 @@ export default function ompPlugin(pi: MinimalHookAPI): void {
         .filter((c): c is { type: string; text: string } => c?.type === "text" && typeof c.text === "string")
         .map((c) => c.text);
       const resultStr = textParts.join("\n");
+      if (_run) {
+        _run.toolResults += 1;
+        if (event?.isError) {
+          _run.toolErrors += 1;
+          const errorKey = createHash("sha256")
+            .update(rawToolName)
+            .update("\0")
+            .update(resultStr)
+            .digest("hex");
+          _run.toolErrorCounts.set(errorKey, (_run.toolErrorCounts.get(errorKey) ?? 0) + 1);
+        }
+      }
 
       const hookInput: HookInput = {
         tool_name: mappedToolName,
@@ -368,6 +505,7 @@ export default function ompPlugin(pi: MinimalHookAPI): void {
   pi.on("turn_end", (event) => {
     try {
       if (!_sessionId) return undefined;
+      if (_run) _run.turns += 1;
       const counts = parseOmpUsage(event);
       if (counts === null) return undefined;
       const usageEvent = buildAgentUsageEvent(counts);
@@ -375,6 +513,147 @@ export default function ompPlugin(pi: MinimalHookAPI): void {
       db.insertEvent(_sessionId, usageEvent as SessionEvent, "PostToolUse");
     } catch {
       // best effort — never break the turn on cost capture
+    }
+    return undefined;
+  });
+  // ── 6. context — concern persistence ─────────────────────
+  pi.on("context", (event) => {
+    try {
+      if (!_sessionId) return undefined;
+
+      for (const message of event.messages ?? []) {
+        const isUser = message.role === "user";
+        const isAdvisor = message.customType === "advisor";
+        if (!isUser && !isAdvisor) continue;
+
+        const messageKey = getContextMessageKey(message);
+        if (!messageKey || _scannedContextMessages.has(messageKey)) continue;
+        _scannedContextMessages.add(messageKey);
+
+        if (isUser) {
+          const text = getMessageText(message.content);
+          if (!text) continue;
+
+          let hasUserConcern = false;
+          for (const userEvent of extractUserEvents(text)) {
+            db.insertEvent(_sessionId, userEvent, "Context");
+            if (userEvent.category === "concern") hasUserConcern = true;
+          }
+          if (hasUserConcern && _run) _run.hasUserConcern = true;
+          continue;
+        }
+
+        for (const note of getAdvisorNotes(message.details)) {
+          const noteText = note.note?.trim();
+          if (!noteText) continue;
+          const severity = getAdvisorSeverity(note.severity);
+          db.insertEvent(
+            _sessionId,
+            buildConcernEvent(
+              `advisor_${severity}`,
+              "advisor",
+              severity,
+              noteText,
+              note.advisor,
+            ),
+            "Context",
+          );
+          if (_run) _run.hasAdvisorNote = true;
+        }
+      }
+    } catch {
+      // best effort — context inspection must not affect the provider request
+    }
+    return undefined;
+  });
+
+  pi.on("agent_start", () => {
+    try {
+      if (!_run) _run = createRunState();
+    } catch {
+      // best effort
+    }
+    return undefined;
+  });
+
+  pi.on("auto_retry_start", (event) => {
+    try {
+      if (!_sessionId) return undefined;
+      if (_run) _run.retries += 1;
+      db.insertEvent(
+        _sessionId,
+        buildConcernEvent(
+          "runtime_concern",
+          "runtime",
+          "nit",
+          "Automatic retry started.",
+          undefined,
+          getRetryMetrics(event, _run),
+          ["auto_retry_started"],
+        ),
+        "AutoRetryStart",
+      );
+    } catch {
+      // best effort
+    }
+    return undefined;
+  });
+
+  pi.on("auto_retry_end", (event) => {
+    try {
+      if (!_sessionId) return undefined;
+      const failed = event.success === false;
+      if (failed && _run) _run.failedRetries += 1;
+      db.insertEvent(
+        _sessionId,
+        buildConcernEvent(
+          "runtime_concern",
+          "runtime",
+          failed ? "concern" : "nit",
+          failed ? "Automatic retry failed." : "Automatic retry completed.",
+          undefined,
+          getRetryMetrics(event, _run),
+          [failed ? "auto_retry_failed" : "auto_retry_succeeded"],
+        ),
+        "AutoRetryEnd",
+      );
+    } catch {
+      // best effort
+    }
+    return undefined;
+  });
+
+  pi.on("agent_end", (event) => {
+    try {
+      if (event.willContinue === true) return undefined;
+
+      const run = _run;
+      _run = null;
+      if (!run || !_sessionId) return undefined;
+
+      const reasons = getRetrospectiveReasons(run);
+      if (reasons.length === 0) return undefined;
+      db.insertEvent(
+        _sessionId,
+        buildConcernEvent(
+          "workflow_retrospective",
+          "retrospective",
+          "concern",
+          "Workflow needs review.",
+          undefined,
+          {
+            turns: run.turns,
+            tool_results: run.toolResults,
+            tool_errors: run.toolErrors,
+            retries: run.retries,
+            failed_retries: run.failedRetries,
+          },
+          reasons,
+        ),
+        "AgentEnd",
+      );
+    } catch {
+      // best effort
     }
     return undefined;
   });
